@@ -1,160 +1,187 @@
 # Helpa Health
 
-> Helping people move from silent distress to the right next step.
+> AI-assisted, WhatsApp-first mental health triage for Nigeria and, over time, wider African contexts.
 
-Helpa Health is building an AI-assisted, WhatsApp-first mental health triage experience for Nigeria, with the long-term ambition of serving communities across Africa.
-
-This is a public project overview. The product source code, safety logic, prompts, infrastructure configuration, and private research remain in a separate private repository.
+I designed and built the Helpa Health MVP independently. This public repository explains the product and engineering decisions; the application code, prompts, credentials, and internal safety configuration remain private.
 
 ## The problem
 
-For many people, the hardest part of getting mental health support is not knowing where to begin.
+For many people, the first barrier to mental health support is knowing where to begin. Distress may be expressed as exhaustion, worry, isolation, difficulty functioning, or culturally specific language—not as a clinical label.
 
-Someone may know that they are struggling but not know whether what they feel is temporary stress, something that needs professional attention, or an urgent safety concern. Stigma, cost, uncertainty, limited awareness, and uneven access to mental health professionals make that first step even harder.
+Nigeria also has limited and unevenly distributed mental health capacity. The challenge is therefore not only creating more care, but building a reliable entry and routing layer around the care that exists.
 
-At the same time, scarce care capacity is often difficult to navigate. People who need light support may have no accessible starting point, while people who need urgent help may not be identified and routed quickly enough.
+Helpa is designed to help a person describe what they are experiencing, identify the level and type of concern, and move toward an appropriate next step. It supports triage; it does not diagnose or replace a clinician or emergency service.
 
-Helpa Health is focused on that missing first layer: helping people describe what they are experiencing, understand the seriousness of their distress, and reach an appropriate next step.
+## What I built
 
-## What we are building
+The MVP is a working conversational triage backend that:
 
-Helpa is not intended to replace a therapist, psychiatrist, emergency service, or trusted human relationship. It is designed to become a safe front door into mental health support.
+- receives and verifies inbound WhatsApp messages;
+- conducts a nine-part mental health check-in through ordinary conversation;
+- uses an LLM to extract structured distress signals from free text;
+- validates every model response against a strict schema;
+- scores distress and assigns domain flags with deterministic rules;
+- independently scans every message for explicit crisis language;
+- permanently latches a safety override when the crisis threshold is met;
+- routes the user toward self-help, monitoring, professional support, or crisis guidance;
+- stores session state without persisting raw phone numbers; and
+- safely retries failed message delivery without duplicating completed turns.
 
-Through a familiar conversational channel, Helpa aims to:
+The product is intentionally split into two responsibilities: AI interprets language; deterministic software decides safety and routing.
 
-- make it easier to begin talking about emotional distress;
-- turn a person's own words into structured, reviewable signals;
-- identify important areas of concern without presenting a diagnosis;
-- recognize when safety may be at risk;
-- suggest a level of support that matches the person's needs; and
-- help people move toward self-help, continued monitoring, community support, professional care, or urgent help.
+## How it is built
 
-The experience is being designed around WhatsApp because access should meet people in a channel they already understand, rather than asking them to find, download, and learn another platform before they can ask for help.
+### Message flow
 
-## How AI helps
+~~~mermaid
+flowchart TD
+    A[User sends a WhatsApp message] --> B[Meta WhatsApp Cloud API]
+    B --> C[FastAPI webhook<br/>signature verification and fast acknowledgement]
+    C --> D[Python background turn processor]
+    D --> E[Load session state<br/>Redis, then PostgreSQL, then memory fallback]
+    E --> F[Deterministic crisis-language scan]
 
-Mental health does not always arrive in neat clinical language. People speak through stories, slang, short replies, uncertainty, humour, silence, and culturally specific expressions of distress.
+    F -->|Explicit crisis phrase| J[Latch safety override]
+    F -->|No explicit phrase| G[LLM signal extraction<br/>Claude Haiku or OpenAI]
+    G --> H[Strict JSON validation<br/>scores plus confidence]
+    H -->|Invalid, unavailable, or low confidence| I[Ask the pending question directly]
+    H -->|Valid| K[Deterministic Triage-9 engine<br/>score and domain flags]
+    K --> L{Safety threshold reached?}
+    L -->|Yes| J
+    L -->|No| M[Ask next question or select care path]
 
-AI can help interpret that free-form conversation and organize it into consistent signals. This can make a structured check-in feel less like a form and more like a conversation, while allowing the service to support more people than a fully manual first-contact process could.
+    I --> N[Deterministic response templates]
+    M --> N
+    J --> O[Verified crisis guidance]
+    N --> P[Reply through WhatsApp Cloud API]
+    O --> P
+    P --> Q[Persist state and metadata-only turn record]
+~~~
 
-Helpa's approach gives AI a deliberately limited role:
+### Backend and integration
 
-- AI helps understand language and extract possible distress signals.
-- Structured rules calculate scores and determine care pathways.
-- Safety-sensitive decisions are not left to a model's improvisation.
-- Unclear or low-confidence interpretations lead to clarification, not guessing.
-- Crisis guidance must remain available even when an AI provider is unavailable.
+The backend is written in **Python 3.12** with **FastAPI**. The webhook validates Meta's request signature, acknowledges the request quickly so WhatsApp does not retry unnecessarily, and hands the conversation turn to background processing.
 
-The aim is not an all-knowing chatbot. It is a carefully governed partnership between conversational AI, explicit safety rules, clinical review, and human care networks.
+Outbound replies use the **Meta WhatsApp Cloud API** through an asynchronous HTTP client.
+
+### AI extraction
+
+The default extraction provider is **Anthropic Claude Haiku**. **OpenAI** is supported as a configurable alternative behind the same provider interface.
+
+The model does not return prose for the application to trust. It returns strict JSON containing nullable distress signals for the nine triage dimensions plus a confidence score. Pydantic rejects malformed JSON, extra fields, wrong types, and values outside the accepted range.
+
+A validated extraction is passed to the rules engine. The model never chooses whether to escalate a user.
+
+### Rules, scoring, and routing
+
+The deterministic Triage-9 engine:
+
+1. records validated answers;
+2. calculates the core distress score from the first eight dimensions;
+3. keeps domain-specific concerns visible instead of reducing everything to one number;
+4. evaluates the ninth, safety-focused signal separately;
+5. selects a stepped-support path; and
+6. prevents a crisis-latched session from being downgraded later.
+
+The output is a structured routing decision with risk level, urgency, care tier, and referral intent. This makes the result usable by future human-support and referral systems without asking another model to reinterpret the conversation.
+
+### Data storage
+
+- **Redis** keeps a fast, expiring copy of active session state.
+- **PostgreSQL** stores durable session state and a metadata-only turn ledger.
+- **SQLAlchemy async** provides the persistence layer, with **Alembic** migrations.
+- An in-memory layer keeps the conversation available during local development or a storage outage.
+- Phone numbers are converted to keyed HMAC hashes before storage; raw message content is not written to application logs or the turn ledger.
+
+## Key engineering decisions
+
+### 1. Safety is controlled by fixed rules
+
+An LLM is useful for interpreting language, but probabilistic output should not own a life-critical decision. Helpa uses a deterministic crisis scanner before the model call and a separate rule-based safety threshold after structured extraction. Either path can activate the same latching crisis state.
+
+### 2. The system fails closed when AI is unavailable
+
+If the provider times out, has no API key, returns malformed JSON, or violates the schema, Helpa records no guessed score. It asks the current triage question directly so the conversation can continue without AI. The deterministic crisis scanner remains active even when every model provider is down.
+
+### 3. Low confidence produces a follow-up, not an assumption
+
+A model response below the confidence threshold is discarded for ordinary scoring. The user is asked a clear follow-up question instead. Safety-positive signals are treated conservatively so uncertainty cannot silently suppress a possible risk.
+
+### 4. Crisis routing cannot be downgraded
+
+Crisis and non-crisis decisions use different validated data types. A crisis-latched state cannot be represented as a lighter care path, which makes an accidental downgrade structurally invalid rather than merely discouraged by a comment.
+
+### 5. Delivery favors a second attempt over silence
+
+A WhatsApp message is marked as processed only after the reply attempt completes. If delivery fails, the retry remains eligible. This deliberately accepts the small risk of a duplicate reply rather than losing a response, especially during a crisis turn.
+
+## Testing the AI and safety paths
+
+The test strategy checks both model interpretation and the deterministic boundaries around it:
+
+- **Schema and provider tests** simulate missing keys, unknown providers, malformed output, refusals, timeouts, and low-confidence results.
+- **Extraction tests** verify that free text becomes the expected structured signals and that uncertain values are not silently accepted.
+- **Adversarial safety tests** cover indirect self-harm language, obfuscation, Nigerian English, Nigerian Pidgin, and an initial Yoruba phrase set.
+- **Corpus-based recall evaluation** runs a labeled crisis-language dataset through the deterministic scanner. The scanner-owned subset has a 100% recall merge gate.
+- **Golden conversation transcripts** test full multi-turn behavior and protect against regressions in question order, scoring, and crisis interruption.
+- **Invariant tests** prove that an activated safety override stays latched and can never route into a lower-risk response.
+- **Persistence and delivery tests** cover Redis/PostgreSQL fallback behavior, webhook retries, and duplicate-message handling.
+
+The local-language corpus is engineer-drafted and is not presented as clinically or culturally complete. It requires review and expansion by Nigerian clinicians and fluent local-language speakers; a green automated test proves coverage of the corpus, not coverage of every real-world expression.
 
 ## The Triage-9 approach
 
-Helpa's early triage model uses a brief nine-part conversational check-in called **Triage-9**.
+Triage-9 is a brief conversational check-in across emotional distress, anxiety, stress, functioning, difficult experiences, social connection, and personal safety.
 
-The check-in looks across several dimensions of wellbeing, including emotional distress, anxiety, stress, day-to-day functioning, difficult experiences, social connection, and personal safety.
+Responses produce an overall distress picture plus separate domain flags. The result is not a diagnosis. It estimates the level of support that may be appropriate:
 
-A typical journey is:
+- self-guided support;
+- continued monitoring;
+- counselling or professional support;
+- prioritized human attention; or
+- immediate crisis guidance.
 
-**Conversation → structured signals → distress picture → safety check → appropriate next step**
+The safety signal sits outside the ordinary total. A possible crisis interrupts the standard flow instead of being averaged into a lower overall score.
 
-### Distress scoring
+## How AI helps
 
-Responses are organized into an overall picture of current distress. The score is not a diagnosis and is not meant to label a person. It is a way to estimate the intensity of support that may be appropriate.
+People rarely describe distress in questionnaire language. AI lets Helpa interpret natural conversation while preserving a consistent structured output for the rules engine.
 
-Helpa also keeps important areas of concern visible instead of reducing everything to one number. Two people with a similar overall score may need different support because their experiences and risks are different.
+The model's role is deliberately narrow: understand language and propose signals. It cannot set policy, lower a safety state, select a helpline, or decide that a person is safe. This separation makes provider changes possible without changing the product's safety behavior.
 
-### Safety comes first
+## Why this is different
 
-The safety portion of the check-in is treated differently from ordinary scoring. A possible crisis should interrupt the usual flow and move the conversation toward immediate, verified support.
+Helpa is not designed as another general-purpose wellness chatbot. It is an attempt to build the missing navigation layer around scarce mental health capacity:
 
-This safety boundary is intentionally designed to be deterministic and conservative. AI may help recognize language, but explicit rules—not a model's opinion—control escalation.
+- a familiar WhatsApp entry point;
+- structured triage without pretending to diagnose;
+- AI-assisted understanding with deterministic safety;
+- routing based on level and type of need;
+- a future bridge to counsellors, clinics, NGOs, universities, employers, and community programmes; and
+- design assumptions that begin with Nigerian access patterns and language rather than adding localization later.
 
-### Stepped support
+The conversation is the front door. The longer-term product is the infrastructure that identifies, structures, routes, and follows up on need.
 
-The resulting pathway can range from:
+## Early pilot feedback
 
-- practical self-guided support;
-- continued check-ins and monitoring;
-- encouragement to speak with a counsellor or other professional;
-- prioritized human support; or
-- immediate crisis resources.
+Nine early responses have been collected for the initial product-discovery exercise. This is exploratory feedback, not clinical validation or evidence of improved health outcomes.
 
-These pathways are intended to connect people to the least intensive support that can safely meet their needs, while escalating quickly when risk is higher.
+The response analysis is still being documented. Rather than inventing conclusions, this public overview will be updated with the questions asked, the strongest recurring findings, and the product changes linked to those findings once that analysis is complete.
 
-## Closing the gap in Nigeria and Africa
+Clinical validation will require a larger study, qualified oversight, appropriate ethical review, and culturally representative participation.
 
-Africa's mental health challenge is not only about the number of professionals. It is also about the missing connective infrastructure around the care that already exists: early identification, trusted entry points, consistent triage, appropriate routing, follow-up, and feedback.
+## Current status
 
-Helpa's long-term vision is to help build that connective layer.
+The MVP backend, triage flow, structured AI extraction, deterministic scoring, safety override, persistence layers, and automated safety tests have been built privately.
 
-A WhatsApp-first entry point can lower the practical barrier to starting a conversation. Structured triage can help limited human capacity focus where it is most needed. Partnerships with counsellors, clinics, NGOs, universities, employers, community organizations, and public programmes could turn a digital first step into a real path toward care.
+Work still required before a real-world launch includes clinical-advisor review, broader Nigerian language and cultural review, verified care partnerships, privacy and legal review, production monitoring, and responsible pilot validation.
 
-This cannot be achieved by copying a model built for another context. Language, trust, family and community relationships, stigma, available services, and expressions of distress vary across countries and cultures. Local clinical review and cultural adaptation are requirements, not optional polish.
+## Repository boundary
 
-## The innovative perspective
+This public repository contains the project overview only. It does not contain production source code, prompts, credentials, user data, or internal safety configuration.
 
-Helpa is not simply trying to build another wellness chatbot.
-
-The larger idea is to create a mental health navigation layer: infrastructure that helps people enter the system, helps care providers understand the level and type of need, and helps institutions see where support capacity is missing.
-
-The conversational experience is the front door. The deeper innovation is the structure behind it:
-
-- meeting people in a familiar channel;
-- combining AI accessibility with rule-based safety;
-- separating distress detection from diagnosis;
-- routing people according to need rather than treating every case the same;
-- supporting task-sharing without pretending that technology replaces professionals; and
-- designing for the realities of African care systems from the beginning.
-
-## Planned nine-person learning pilot
-
-The first pilot is intentionally small: **nine participants**.
-
-Its purpose is to learn, not to make clinical-effectiveness claims. The pilot will explore questions such as:
-
-- Does the conversation feel understandable and respectful?
-- Are the questions easy to answer in natural language?
-- Where do people hesitate, disengage, or feel misunderstood?
-- Does the resulting guidance feel clear and actionable?
-- Which Nigerian expressions of distress need better recognition?
-- What would make people trust—or distrust—the experience?
-- Where must a human become involved sooner?
-
-Feedback from this pilot will be used to refine language, conversation flow, safety testing, and future research plans. A nine-person pilot cannot validate a clinical instrument or prove improved health outcomes; those require larger studies, clinical oversight, and appropriate ethical review.
-
-## Principles guiding the work
-
-- **Triage, not diagnosis.**
-- **Safety before engagement.**
-- **Clarify rather than guess.**
-- **Collect and expose as little sensitive information as possible.**
-- **Require meaningful consent before any future data handoff.**
-- **Use current, verified crisis resources.**
-- **Design with local communities, not merely for them.**
-- **Keep clinical and legal judgment with qualified humans.**
-- **Be honest about what has and has not yet been validated.**
-
-## Current stage
-
-Helpa Health is currently an MVP under active development. The core concept, conversational triage flow, distress structuring, safety boundaries, and routing approach are being developed and tested privately.
-
-Before a real-world launch, the project requires continued clinical-advisor review, cultural and linguistic review, privacy and legal review, verified care partnerships, and responsible pilot validation.
-
-## Public and private boundaries
-
-This repository exists so the idea, mission, product direction, and learning journey can be discussed openly without exposing private implementation details.
-
-It intentionally contains:
-
-- this public overview; and
-- no production source code, private prompts, credentials, user information, or internal safety configurations.
-
-## Collaboration
-
-Helpa Health welcomes thoughtful conversations with Nigerian and African mental health professionals, researchers, crisis-support organizations, community leaders, patient advocates, responsible-AI practitioners, and institutions interested in improving access to care.
-
-If this mission overlaps with your work, please open a GitHub issue to start a conversation.
+If you are a Nigerian or African mental health professional, researcher, crisis-support organization, patient advocate, or responsible-AI practitioner interested in this work, please open a GitHub issue.
 
 ---
 
-**Important:** Helpa Health is under development and is not currently a substitute for professional medical advice, diagnosis, treatment, or emergency services. If you or someone else may be in immediate danger, contact local emergency services or a verified crisis-support service in your location.
+**Important:** Helpa Health is under development and is not a substitute for professional medical advice, diagnosis, treatment, or emergency services. If someone may be in immediate danger, contact local emergency services or a verified crisis-support service in their location.
